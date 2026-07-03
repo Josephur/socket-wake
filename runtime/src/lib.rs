@@ -101,18 +101,16 @@ pub extern "C" fn socket_wake_feed(
     // SAFETY: caller guarantees `samples` is the valid element count.
     let pcm_slice = unsafe { core::slice::from_raw_parts(pcm, samples) };
     // Feed the mel extractor; if it produced a frame, run the CNN and
-    // pass the resulting logit to the state machine. The CNN's actual
-    // integration here is a stub for v1 (the canonical model lands in
-    // Task 14); until then the detector is wired but doesn't fire on
-    // real audio.
-    let mut ran = false;
-    while let Some(_frame) = inner.mel.process_frame(pcm_slice).get(..) {
-        ran = true;
-        // Real CNN call lands in Task 14. For now, break out -- the state
-        // machine isn't fed and we never fire.
-        break;
+    // pass the resulting logit to the state machine. The current API only
+    // produces one frame per call (subsequent calls advance the mel), so we
+    // process at most one frame per feed().
+    if let Some(frame) = inner.mel.process_frame(pcm_slice).get(..) {
+        if let Ok(logits) = cnn::Cnn::run(frame, &inner.weights) {
+            if let Some(&logit) = logits.first() {
+                inner.state.feed(logit);
+            }
+        }
     }
-    let _ = ran;
     // v1 doesn't use the arena yet -- peak_ram is just the static size of
     // DetectorInner, which the memory-profile test asserts is < 24 KB.
     // The arena module is exercised by its own tests in Task 6.
