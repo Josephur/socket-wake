@@ -235,15 +235,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn hann_window_at_center_is_one() {
+    fn silence_is_at_log_floor() {
+        // Silence: energy = 0, log10(0 + 1e-6) ~= -6, scaled to INT8 ~= -95.
+        // All mels must be near that floor.
         let mut m = MelExtractor::new(SAMPLE_RATE_HZ).unwrap();
-        // Force a frame of zeros; the Hann window computed inside peaks at 1.0
-        // in the middle. We don't directly expose it, but a silent frame
-        // should produce ~zero mel.
         let silent = vec![0i16; WINDOW_SAMPLES];
         let out = m.process_frame(&silent);
         for &v in out {
-            assert!(v.abs() <= 2, "silence must produce near-zero mel: got {}", v);
+            assert!((-127..=-80).contains(&v),
+                "silence should be at the log-floor (~-95): got {}", v);
         }
     }
 
