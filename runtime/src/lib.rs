@@ -5,6 +5,8 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 #![deny(unsafe_code)]
 
+pub mod mel;
+
 #[cfg(test)]
 mod tests {
     #[test]
