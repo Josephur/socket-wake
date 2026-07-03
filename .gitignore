@@ -6,10 +6,18 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .venv/
-# Models / training artifacts
+# Models / training artifacts. weights.bin + header.h (the compiled
+# runtime deliverable, loaded via include_bytes! in the Rust tests) are
+# NOT excluded here -- only the large/regeneratable intermediates are:
+# raw downloaded audio, assembled training tensors, and PyTorch
+# checkpoints. See docs/training.md for exact reproduction commands.
 *.ckpt
 *.pth
 *.onnx
+models/*/checkpoint.pt
+models/*/train_dataset*.pt
+models/*/train_data.npz
+models/*/noise_clips/
 # IDE
 .vscode/
 .idea/build.log

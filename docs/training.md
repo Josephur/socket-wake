@@ -94,10 +94,29 @@ bucket from the three-bucket recipe above — small, fast to pull, and we
 don't need MUSAN's speech/music subsets since our hard-negative *speech*
 already comes from TTS.
 
+**Do NOT use `datasets.load_dataset()` for this** — it auto-decodes the
+Audio feature via `torchcodec`, which needs FFmpeg's "full-shared" DLL
+build. That's not what's normally installed on a dev box and isn't worth
+fighting; `load_dataset()` will throw a wrapped `DatasetGenerationError`
+whose real cause (buried several frames down) is
+`ModuleNotFoundError: No module named 'torchcodec'` or, after installing
+it, `OSError: Could not load this library: ...libtorchcodec_core8.dll`.
+
+Instead, pull the raw `.wav` files directly via `huggingface_hub`
+(`list_repo_files` + threaded HTTP GET). This is what
+`python/socket_wake/data/fetch_musan.py` does:
+
 ```powershell
-# via huggingface_hub / datasets, or a direct file pull -- document the
-# exact command here once the data-build stage confirms it works.
+cd D:\Arduino\socket-wake
+python -m socket_wake.data.fetch_musan
+# -> models/hey-socket-v1/noise_clips/*.wav (930 files, ~16 kHz mono
+#    int16 already -- verified by inspecting a downloaded clip's wave
+#    header, no resampling needed)
 ```
+
+Result of the actual run: 930/930 clips downloaded successfully via 16
+parallel workers, essentially instant once the repo file listing (a
+single JSON API call) completes.
 
 If `bilguun/musan-noise` becomes unavailable, the fallback is
 [`noisy-alpaca-test/MUSAN-noise-audio-only`](https://huggingface.co/datasets/noisy-alpaca-test/MUSAN-noise-audio-only)
@@ -124,7 +143,7 @@ real depthwise/pointwise conv stack layer-by-layer (the runtime's
 `apply_layer` — nobody has used this multi-layer path yet; today's
 "1 layer" exports are the only thing that's been exercised).
 
-## Reproducing the current canned model
+## Reproducing the v1 (TTS-only) canned model
 
 ```powershell
 cd D:\Arduino\socket-wake
@@ -133,5 +152,98 @@ python -m socket_wake.export models/hey-socket-v1/checkpoint.pt models/hey-socke
 cargo test -p socket-wake-runtime --test canned_model_test -- --nocapture
 ```
 
-(TODO: the v2 pipeline with real noise negatives will replace or extend
-this — update this section once that lands.)
+This is the TTS-only dataset (`train_dataset.pt`) with no noise negatives
+— superseded by the v2 recipe below, kept for reference/comparison.
+
+## Reproducing the v2 (noise-augmented) dataset
+
+```powershell
+cd D:\Arduino\socket-wake
+python -m socket_wake.data.fetch_musan          # -> noise_clips/*.wav (930 files)
+python -m socket_wake.data.build_v2_dataset     # -> train_dataset_v2.pt
+```
+
+`build_v2_dataset.py` assembles four buckets into one dataset:
+
+1. **Positives (clean)** — fresh "hey socket" TTS synthesis across 6
+   Kokoro voices + F5-TTS (`_VOICE_COMBOS`, 9 combos × `N_POS_PER_VOICE`
+   requests each).
+2. **Positives (SNR-mixed)** — each clean positive gets
+   `SNR_COPIES_PER_POS` (2) copies mixed with a random noise clip at a
+   random SNR in `SNR_RANGE_DB` (5-30 dB), via `snr_mix.mix_at_snr()`.
+3. **Negatives (speech)** — v1's existing negative windows reused as-is
+   (saves TTS calls) PLUS ~150 new hard-negative phrases: phonetic
+   near-misses to "hey socket" (`HARD_NEG_PHONETIC`) and unrelated
+   everyday sentences (`HARD_NEG_UNRELATED`).
+4. **Negatives (noise)** — the 930 MUSAN clips, windowed and capped.
+
+### Critical gotcha: cap windows-per-noise-clip, or class balance breaks silently
+
+**First attempt at this pipeline produced a dataset with an 86:1
+negative:positive ratio** (2,305,878 negative windows vs 26,688
+positive) that would have silently trained a useless model — one that
+always predicts "not target" and scores ~99% "accuracy" while having 0%
+recall on the actual wake word. The cause: MUSAN noise clips run many
+seconds long, and windowing with a 1-frame hop (matching the short TTS
+utterances' stacking) produces thousands of near-duplicate overlapping
+windows per clip — averaged out to ~2,400 windows per clip across all
+930 clips.
+
+**Fix:** noise clips use a *different*, non-overlapping hop
+(`NOISE_HOP_FRAMES = WINDOW_FRAMES`) plus a hard per-clip cap
+(`NOISE_WINDOWS_PER_CLIP_CAP = 30`, randomly subsampled if a clip would
+exceed it). This keeps noise diversity (windows drawn from all 930
+clips) without letting clip *length* dominate the negative pool.
+
+**Lesson for future pipeline changes:** whenever a new negative source
+is added, sanity-check the resulting class balance (`Counter(y)`) before
+training — don't assume "more negative data" is automatically fine. A
+K:1 negative:positive ratio beyond roughly 5-10:1 should be treated as a
+red flag worth investigating, not a given.
+
+### Result of the actual v2 build (2026-07-03)
+
+```
+total windows: 111,958  (target=19,311, not_target=92,647, ratio ~4.8:1)
+sources:
+  pos_clean_windows:        6,437
+  pos_snr_mixed_windows:   12,874
+  neg_v1_reused_windows:   52,130
+  neg_hard_negative_windows: 15,057
+  neg_pure_noise_windows:   25,460
+  n_positive_base_clips:       60   (of 90 requested -- F5-TTS endpoint
+                                      timed out on some requests under
+                                      load; see below)
+  n_hard_negative_clips:      102   (of 150 requested, same reason)
+  n_noise_clips:               930  (all succeeded)
+train/test split: 100,763 / 11,195  (90/10, stratified by class)
+```
+
+**F5-TTS reliability note:** the `mouth.stack-tech.local:7860` F5-TTS
+endpoint threw repeated `POST ... failed twice: timed out` errors under
+the ~12-worker concurrent load this script uses (`MAX_WORKERS = 12`,
+shared across both Kokoro and F5 requests). Kokoro's OpenAI-compatible
+endpoint held up fine at the same concurrency. If F5 clip yield drops
+noticeably below what you requested, consider lowering `MAX_WORKERS` or
+routing more of the load to Kokoro.
+
+**Concurrency gotcha:** don't run `build_v2_dataset.py` from two
+processes at once against the same output path — a race between two
+runs (one with the pre-cap code, one with the post-cap code) produced a
+corrupted intermediate file that silently carried over the *old*,
+imbalanced window counts even after the cap fix landed, because the
+slower/older process's write won the race and overwrote the correct
+one. If results look suspicious after a code change, verify with
+`tasklist` (Windows) / `ps` (Unix) that no stale process is still
+running the old code before trusting a rebuild's output.
+
+### Then train + export + verify, same as v1
+
+```powershell
+# train.py needs to point at train_dataset_v2.pt instead of
+# train_dataset.pt -- confirm/update the script's dataset path before
+# running if it hasn't been updated yet.
+python models/hey-socket-v1/train.py
+python -m socket_wake.export models/hey-socket-v1/checkpoint.pt models/hey-socket-v1
+cargo test -p socket-wake-runtime --test canned_model_test -- --nocapture
+```
