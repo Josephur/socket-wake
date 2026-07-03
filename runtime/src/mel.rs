@@ -156,7 +156,6 @@ pub struct MelExtractor {
     ring: [i16; WINDOW_SAMPLES],
     ring_len: usize,
     out: [i8; N_MELS],
-    fb: [[f32; N_FFT / 2 + 1]; N_MELS],
 }
 
 impl MelExtractor {
@@ -168,7 +167,6 @@ impl MelExtractor {
             ring: [0i16; WINDOW_SAMPLES],
             ring_len: 0,
             out: [0i8; N_MELS],
-            fb: mel_filterbank(),
         })
     }
 
@@ -208,11 +206,17 @@ impl MelExtractor {
         let mut spec = [0.0f32; N_FFT / 2 + 1];
         magnitude_spectrum(&windowed, &mut spec);
 
+        // Compute filterbank on the fly each frame (40 * 257 f32 ops =
+        // ~10k ops, well under our 10 ms budget) so we don't have to store
+        // it inside the struct -- that footprint (~41 KB) blew the
+        // 24 KB detector memory budget.
+        let fb = mel_filterbank();
+
         // Mel filterbank + log.
         for m in 0..N_MELS {
             let mut energy = 0.0f32;
             for k in 0..N_FFT / 2 + 1 {
-                energy += self.fb[m][k] * spec[k];
+                energy += fb[m][k] * spec[k];
             }
             // log10 of (energy + 1e-6), scale to INT8.
             let log_e = log10_approx(energy + 1e-6);
