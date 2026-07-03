@@ -2,22 +2,31 @@
 // Integration test: exercise the canned "hey socket" model end-to-end through
 // the public C ABI (`socket_wake_create` / `feed` / `detected` / `destroy`).
 //
-// The model was fit to a synthetic distribution where:
-//   - the "target" class concentrates energy in mels 0-20 (the 0-2 kHz band),
-//   - the "not_target" class spreads energy uniformly across all 40 mels.
-// At the PCM level that translates to a low-frequency tone (800 Hz) for
-// target vs broadband / high-frequency content for not-target. We replicate
-// that contrast at 16 kHz sample rate, feed 1 second through the detector
-// (16000 samples = ~97 frames at the 30 ms/10 ms window/hop), and check
-// the state machine output.
+// As of the v2 dataset (see docs/training.md "Reproducing the v2
+// (noise-augmented) dataset"), the model is trained on REAL TTS-synthesized
+// "hey socket" utterances (Kokoro + F5-TTS, multiple voices), real MUSAN
+// noise clips as pure negatives, SNR-mixed positive+noise combinations, and
+// ~100 hard-negative phrases (phonetic near-misses + unrelated sentences) --
+// not synthetic mel-distribution data. Held-out test-split metrics: recall
+// ~92%, precision ~62%, per-window false-accept rate ~12% (see training run
+// log in docs/training.md). That FAR is measured per-window, not through
+// the runtime's state machine (which requires 4 consecutive above-threshold
+// frames before firing and provides real smoothing), so it's an upper bound
+// on the real-world false-accept rate, not the final number.
+//
+// The 800 Hz / 6 kHz test tones below are NOT representative of the
+// training distribution (real speech, not pure sine waves), so this test
+// still can't assert "fires on the literal words hey socket" -- that needs
+// either real recorded audio or TTS-synthesized PCM fed through this same
+// test harness. What we DO verify here: the wiring runs end-to-end without
+// crashing, peak RAM stays in budget, and a broadband tone doesn't trigger
+// (a weak proxy for "the model isn't trivially trigger-happy").
 //
 // The exported blob is a single 400 -> n_classes dense layer (40 mels *
-// 10 frames of stacked mel input to n_classes), so the CNN shape check
-// matches the runtime's stacked-buffer construction. With the wiring
-// resolved, the test below pins what real PCM currently produces from
-// a model that was trained on synthetic-mel features: the not-target
-// case still asserts silence, and the target case reports the firing
-// flag plus peak RAM.
+// 10 frames of stacked mel input to n_classes) -- see docs/training.md
+// "Known limitation" for why this caps the model's representational
+// capacity regardless of training data quality, and what a proper fix
+// (multi-layer per-layer export) would look like.
 
 /// Canned model weights baked in from `models/hey-socket-v1/weights.bin`.
 /// The path is relative to this file: `canned_model_test.rs` lives in

@@ -240,10 +240,65 @@ running the old code before trusting a rebuild's output.
 ### Then train + export + verify, same as v1
 
 ```powershell
-# train.py needs to point at train_dataset_v2.pt instead of
-# train_dataset.pt -- confirm/update the script's dataset path before
-# running if it hasn't been updated yet.
 python models/hey-socket-v1/train.py
 python -m socket_wake.export models/hey-socket-v1/checkpoint.pt models/hey-socket-v1
 cargo test -p socket-wake-runtime --test canned_model_test -- --nocapture
 ```
+
+`train.py` now points at `train_dataset_v2.pt` and uses class-weighted
+`CrossEntropyLoss` (inverse to class frequency in the training split) --
+the ~4.8:1 imbalance is much better than the 86:1 bug above, but still
+skewed enough to bias an unweighted model toward "always predict
+not-target."
+
+### Result of the actual v2 training run (2026-07-03)
+
+```
+class_counts=[83383.0, 17380.0]  class_weights=[0.604, 2.899]
+epoch 0 loss=0.4747  ...  epoch 9 loss=0.2068
+test_acc=0.8873
+```
+
+Accuracy alone is misleading on an imbalanced set even with weighting --
+the confusion matrix on the held-out test split tells the real story:
+
+```
+TP=1779  FP=1110  TN=8154  FN=152
+precision=0.6158  recall=0.9213
+false-accept rate (of all negative test windows): 0.1198
+```
+
+**Read this honestly:** recall is good (92% of real wake-word windows
+are caught), but precision is weak (only 62% of "detected" windows are
+actually correct) and the per-window false-accept rate (~12%) is far
+above the design spec's ≤1/hour target. This is a real, measured
+result, not a guess -- and it's the expected outcome of the "Known
+limitation" below: collapsing the trained model to a single linear
+layer caps how tight a decision boundary it can draw, regardless of how
+good the training data is. The v2 data fix (real noise, hard negatives)
+is a genuine improvement over v1's TTS-only training (which had *no*
+noise exposure at all and would have been far worse in a real FAR
+test), but it is not sufficient on its own to hit the ≤1/hour target.
+
+**Important caveat on the FAR number above:** it's measured per-window
+on disconnected classifier outputs, not through the runtime's actual
+state machine, which requires 4 consecutive above-threshold frames
+before firing (`Detector::new(threshold=30, hold_frames=4)` in
+`runtime/src/lib.rs`). That hold-frame requirement provides real
+smoothing a raw per-window FAR doesn't capture -- the true end-to-end
+FAR is very likely lower than 12%, but "how much lower" hasn't been
+measured. Building a proper FAR/FRR benchmark that drives the actual
+Rust detector (not just the Python classifier in isolation) is the
+next real task before calling any version of this model production
+enough to trust in a live device.
+
+**What actually needs to happen to close the gap** (not yet done):
+
+1. Build the FAR/FRR benchmark harness that drives the real
+   `socket_wake_feed`/`socket_wake_detected` C ABI over held-out noise
+   and positive streams, measuring detections-per-hour, not per-window
+   classifier accuracy.
+2. If the linear export's ceiling is the bottleneck (likely, given
+   precision plateaus around 62% despite reasonable training data),
+   implement the multi-layer per-layer export path so the trained
+   model's nonlinearity survives into the deployed weights.

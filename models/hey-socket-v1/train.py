@@ -1,10 +1,19 @@
-"""Train KWSClassifier wake-word on the v2 TTS dataset. Minimal loop.
+"""Train KWSClassifier wake-word on the v2 noise-augmented dataset.
 
-Reads train_dataset.pt (x (N,1,40,10) int8, y (N,) int64, split (N,) bool),
-trains KWSClassifier(n_classes=2) -- a 400->128->2 MLP that matches the
+Reads train_dataset_v2.pt (x (N,1,40,10) int8, y (N,) int64, split (N,)
+bool -- see docs/training.md "Reproducing the v2 (noise-augmented)
+dataset" for exactly how this file is built), trains
+KWSClassifier(n_classes=2) -- a 400->128->2 MLP that matches the
 runtime's flat (40 mels * 10 frames) stacked buffer input -- with Adam +
-CrossEntropyLoss on CPU, and writes checkpoint.pt for socket_wake.export
-to consume.
+class-weighted CrossEntropyLoss on CPU, and writes checkpoint.pt for
+socket_wake.export to consume.
+
+Class weighting: the v2 dataset is ~4.8:1 negative:positive (a real
+improvement over an earlier, buggy 86:1 imbalance -- see
+docs/training.md for that story), but still skewed enough that
+unweighted cross-entropy would bias the model toward predicting
+not-target. Weights are set inversely proportional to class frequency
+in the training split.
 """
 
 from pathlib import Path
@@ -19,7 +28,7 @@ HERE = Path(__file__).resolve().parent
 
 
 def main() -> None:
-    payload = torch.load(HERE / "train_dataset.pt", weights_only=False)
+    payload = torch.load(HERE / "train_dataset_v2.pt", weights_only=False)
     x = payload["x"].float() / 127.0
     y = payload["y"].long()
     split = payload["split"].bool()
@@ -30,7 +39,11 @@ def main() -> None:
 
     model = KWSClassifier(n_classes=2)
     opt = torch.optim.Adam(model.parameters(), lr=1e-3)
-    loss_fn = torch.nn.CrossEntropyLoss()
+
+    class_counts = torch.bincount(y_train, minlength=2).float()
+    class_weights = class_counts.sum() / (class_counts.clamp_min(1) * len(class_counts))
+    print(f"class_counts={class_counts.tolist()} class_weights={class_weights.tolist()}")
+    loss_fn = torch.nn.CrossEntropyLoss(weight=class_weights)
 
     for epoch in range(10):
         model.train()
