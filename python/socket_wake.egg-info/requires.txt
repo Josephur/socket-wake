@@ -1,0 +1,8 @@
+numpy>=1.24
+
+[dev]
+pytest>=7
+
+[train]
+torch>=2.1
+torchaudio>=2.1

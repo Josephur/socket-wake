@@ -1,0 +1,10 @@
+pyproject.toml
+socket_wake/__init__.py
+socket_wake.egg-info/PKG-INFO
+socket_wake.egg-info/SOURCES.txt
+socket_wake.egg-info/dependency_links.txt
+socket_wake.egg-info/requires.txt
+socket_wake.egg-info/top_level.txt
+socket_wake/features/__init__.py
+socket_wake/features/mel.py
+tests/test_features.py
