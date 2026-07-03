@@ -28,6 +28,12 @@ pub mod weights;
 use state::Detector;
 use weights::Weights;
 
+/// Number of consecutive mel frames the CNN expects as input. Matches the
+/// export-side collapse (40 mels × 10 frames = 400). Stack 10 frames before
+/// running inference so the canned model's input shape matches the runtime's
+/// per-frame emission rate.
+const CNN_FRAMES: usize = 10;
+
 /// Opaque detector handle. Public to Rust embedders; the C ABI sees it
 /// as `socket_wake_detector_t`.
 ///
@@ -46,6 +52,11 @@ pub struct DetectorInner {
     weights: Weights<'static>,
     mel: mel::MelExtractor,
     state: Detector,
+    /// Ring buffer of the last CNN_FRAMES mel frames. Newest at the end.
+    /// Frames roll in via `push_frame`; once full, the CNN runs on the
+    /// concatenated buffer.
+    frame_ring: [[i8; mel::N_MELS]; CNN_FRAMES],
+    ring_count: usize,
     peak_ram: usize,
 }
 
@@ -80,6 +91,8 @@ pub extern "C" fn socket_wake_create(
             Err(_) => return core::ptr::null_mut(),
         },
         state: Detector::new(30, 4),
+        frame_ring: [[0; mel::N_MELS]; CNN_FRAMES],
+        ring_count: 0,
         peak_ram: 0,
     };
     Box::into_raw(Box::new(inner))
@@ -100,17 +113,36 @@ pub extern "C" fn socket_wake_feed(
     }
     // SAFETY: caller guarantees `samples` is the valid element count.
     let pcm_slice = unsafe { core::slice::from_raw_parts(pcm, samples) };
-    // Feed the mel extractor; if it produced a frame, run the CNN and
-    // pass the resulting logit to the state machine. The current API only
-    // produces one frame per call (subsequent calls advance the mel), so we
-    // process at most one frame per feed().
-    if let Some(frame) = inner.mel.process_frame(pcm_slice).get(..) {
-        if let Ok(logits) = cnn::Cnn::run(frame, &inner.weights) {
-            if let Some(&logit) = logits.first() {
-                inner.state.feed(logit);
+    // Drain every new mel frame produced by this chunk and push each into
+    // the 10-frame ring. Once the ring is full, run the CNN on the stacked
+    // buffer. The canned model expects 400-dim input (40 mels * 10 frames),
+    // so we must see ALL frames from a single feed -- `process_frames`
+    // invokes the closure once per new frame in one drain.
+    inner.mel.process_frames(pcm_slice, |frame| {
+        if inner.ring_count < CNN_FRAMES {
+            inner.frame_ring[inner.ring_count].copy_from_slice(frame);
+            inner.ring_count += 1;
+        } else {
+            for i in 0..CNN_FRAMES - 1 {
+                inner.frame_ring[i] = inner.frame_ring[i + 1];
             }
+            inner.frame_ring[CNN_FRAMES - 1].copy_from_slice(frame);
         }
-    }
+        if inner.ring_count < CNN_FRAMES {
+            return;
+        }
+        let mut stacked = [0i8; mel::N_MELS * CNN_FRAMES];
+        for (i, frame_slot) in inner.frame_ring.iter().enumerate() {
+            stacked[i * mel::N_MELS..(i + 1) * mel::N_MELS]
+                .copy_from_slice(frame_slot);
+        }
+        match cnn::Cnn::run(&stacked, &inner.weights) {
+            Ok(logits) if !logits.is_empty() => {
+                let _ = inner.state.feed(logits[0]);
+            }
+            _ => {}
+        }
+    });
     // v1 doesn't use the arena yet -- peak_ram is just the static size of
     // DetectorInner, which the memory-profile test asserts is < 24 KB.
     // The arena module is exercised by its own tests in Task 6.

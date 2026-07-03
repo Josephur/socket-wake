@@ -12,7 +12,7 @@ const SAMPLE_RATE_HZ: u32 = 16_000;
 const WINDOW_SAMPLES: usize = 480;   // 30 ms @ 16 kHz
 const HOP_SAMPLES: usize = 160;      // 10 ms @ 16 kHz
 const N_FFT: usize = 512;
-const N_MELS: usize = 40;
+pub const N_MELS: usize = 40;
 /// Maps log-mel energy to INT8: `q = round(log_mel * 127 / SCALE)`.
 /// Calibrated on held-out Speech Commands; tunable post-training.
 const INT8_SCALE: f32 = 8.0;
@@ -173,8 +173,10 @@ impl MelExtractor {
     /// Appends samples to an internal ring; when a full window has arrived,
     /// computes one mel frame and stores it in `out`. The returned slice is
     /// valid until the next call. Returns an empty slice if no full frame yet.
-    pub fn process_frame(&mut self, pcm: &[i16]) -> &[i8] {
-        // Fill ring; only produce a frame when we have exactly WINDOW_SAMPLES.
+    /// Appends samples to an internal ring; when a full window has arrived,
+/// computes one mel frame and stores it in `out`. The returned slice is
+/// valid until the next call. Returns an empty slice if no full frame yet.
+pub fn process_frame(&mut self, pcm: &[i16]) -> &[i8] {
         for &s in pcm {
             if self.ring_len < WINDOW_SAMPLES {
                 self.ring[self.ring_len] = s;
@@ -189,6 +191,28 @@ impl MelExtractor {
             }
         }
         &[]
+    }
+
+/// Drains `pcm` and invokes `on_frame` for every new mel frame produced.
+/// Returns the number of frames emitted. Use this when the caller needs
+/// every frame (e.g. to drive a downstream model that expects a stack of
+/// consecutive frames); the simpler `process_frame` only exposes the last.
+pub fn process_frames<F: FnMut(&[i8])>(&mut self, pcm: &[i16], mut on_frame: F) -> usize {
+        let mut n = 0;
+        for &s in pcm {
+            if self.ring_len < WINDOW_SAMPLES {
+                self.ring[self.ring_len] = s;
+                self.ring_len += 1;
+            }
+            if self.ring_len == WINDOW_SAMPLES {
+                self.compute_frame_into_out();
+                self.ring.copy_within(HOP_SAMPLES..WINDOW_SAMPLES, 0);
+                self.ring_len = WINDOW_SAMPLES - HOP_SAMPLES;
+                on_frame(&self.out);
+                n += 1;
+            }
+        }
+        n
     }
 
     fn compute_frame_into_out(&mut self) {
