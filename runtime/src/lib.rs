@@ -5,6 +5,7 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 #![deny(unsafe_code)]
 
+pub mod cnn;
 pub mod mel;
 pub mod weights;
 

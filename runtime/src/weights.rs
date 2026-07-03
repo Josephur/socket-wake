@@ -66,6 +66,7 @@ pub struct LayerDesc {
     pub scale: f32,
 }
 
+#[derive(Debug, PartialEq)]
 pub struct Weights<'a> {
     bytes: &'a [u8],
     n_layers: u16,

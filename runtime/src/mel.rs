@@ -151,6 +151,7 @@ fn exp_approx(x: f32) -> f32 {
     if k >= 0 { p * (1u32 << k.min(31)) as f32 } else { p / (1u32 << (-k).min(31)) as f32 }
 }
 
+#[derive(Debug, PartialEq)]
 pub struct MelExtractor {
     ring: [i16; WINDOW_SAMPLES],
     ring_len: usize,
