@@ -6,6 +6,7 @@
 #![deny(unsafe_code)]
 
 pub mod mel;
+pub mod weights;
 
 #[cfg(test)]
 mod tests {
