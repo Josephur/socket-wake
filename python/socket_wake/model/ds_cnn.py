@@ -58,3 +58,37 @@ class DSCNN(nn.Module):
         x = self.stem(x)
         x = self.blocks(x)
         return self.head(x)
+
+
+class KWSClassifier(nn.Module):
+    """Linear classifier on stacked mel frames (v1 runtime-friendly shape).
+
+    Input: (N, 400) -- 40 mels * 10 frames, INT8-style features matching
+    the runtime's `socket_wake_feed` stacked buffer construction.
+    Output: (N, n_classes) logits.
+
+    For v1 the architecture is intentionally simple: a stack of
+    Linear + ReLU + Linear so the model can learn non-linear patterns
+    across the 400 dims while staying tiny (~50K params) and matching
+    the runtime's flat input exactly. v2 swaps in the DS-CNN-L backbone
+    via a per-layer export path the runtime can execute.
+
+    The forward accepts both 2D ``(N, 400)`` (matching the runtime's
+    stacked buffer) and 4D ``(N, 1, 40, 10)`` (matching the dataset
+    layout) inputs so the same model trains and exports cleanly.
+    """
+
+    def __init__(self, n_classes: int) -> None:
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(400, 128),
+            nn.ReLU(inplace=True),
+            nn.Linear(128, n_classes),
+        )
+
+    def forward(self, x):
+        if x.dim() == 4:  # (N, 1, 40, 10) from the existing dataset
+            x = x.reshape(x.size(0), -1)
+        elif x.dim() == 2:
+            pass  # already (N, 400)
+        return self.net(x)

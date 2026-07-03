@@ -11,16 +11,13 @@
 // (16000 samples = ~97 frames at the 30 ms/10 ms window/hop), and check
 // the state machine output.
 //
-// Caveat (documented via this test, not via lib.rs change): the v1 canned
-// model was exported as a single dense layer whose input is the flat
-// 400-dim (40 mels * 10 frames) collapse from the training input shape,
-// while the runtime's `feed()` loop hands the CNN one 40-dim mel frame at
-// a time. The dense layer's shape check therefore rejects every frame
-// and no logit ever reaches the state machine -- so the wiring today
-// can produce only `detected = false`. Both cases below pin that
-// observable behavior; the "target" case additionally prints the peak
-// RAM and `detected` flag so future readers chasing a real firing
-// detection can see exactly what the harness produced at the same inputs.
+// The exported blob is a single 400 -> n_classes dense layer (40 mels *
+// 10 frames of stacked mel input to n_classes), so the CNN shape check
+// matches the runtime's stacked-buffer construction. With the wiring
+// resolved, the test below pins what real PCM currently produces from
+// a model that was trained on synthetic-mel features: the not-target
+// case still asserts silence, and the target case reports the firing
+// flag plus peak RAM.
 
 /// Canned model weights baked in from `models/hey-socket-v1/weights.bin`.
 /// The path is relative to this file: `canned_model_test.rs` lives in
