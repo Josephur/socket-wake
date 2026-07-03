@@ -1,0 +1,15 @@
+/target/
+**/*.rs.bk
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.venv/
+# Models / training artifacts
+*.ckpt
+*.pth
+*.onnx
+# IDE
+.vscode/
+.idea/
