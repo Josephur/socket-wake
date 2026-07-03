@@ -1,0 +1,13 @@
+[workspace]
+resolver = "2"
+members = ["runtime"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "Apache-2.0"
+repository = "https://github.com/Josephur/socket-wake"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
