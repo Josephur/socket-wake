@@ -16,7 +16,6 @@
 #![allow(unsafe_code)]
 
 extern crate alloc;
-use alloc::vec;
 use alloc::vec::Vec;
 
 pub mod arena;
@@ -28,21 +27,17 @@ pub mod weights;
 use state::Detector;
 use weights::Weights;
 
-/// Number of consecutive mel frames the CNN expects as input. Matches the
-/// export-side collapse (40 mels × 10 frames = 400). Stack 10 frames before
-/// running inference so the canned model's input shape matches the runtime's
-/// per-frame emission rate.
-const CNN_FRAMES: usize = 10;
+/// Mel frames per CNN input window: 1.0 s of audio at the 10 ms hop.
+/// Matches WINDOW_FRAMES in the v3 training pipeline (input = 40x98 HWC).
+pub const CNN_FRAMES: usize = 98;
+
+/// Run one CNN inference every this many new mel frames (30 ms), matching
+/// CADENCE_FRAMES in eval_v3.py -- the cadence the FAR/FRR numbers were
+/// measured at.
+pub const CADENCE_FRAMES: usize = 3;
 
 /// Opaque detector handle. Public to Rust embedders; the C ABI sees it
 /// as `socket_wake_detector_t`.
-///
-/// The arena is wired up in v2 once the CNN callsites need it -- the
-/// borrow-checker doesn't allow a struct that owns its own arena buffer
-/// without an unsafe escape (ouroboros / Pin), and for v1 the only
-/// allocations go through `alloc::vec` in the CNN hot path. Peak RAM is
-/// therefore estimated from the detector's own size for now; the
-/// memory-profile test (Task 6) exercises the arena module separately.
 #[derive(Debug)]
 pub struct DetectorInner {
     /// Weights borrowed from the caller's buffer; the caller is responsible
@@ -52,12 +47,67 @@ pub struct DetectorInner {
     weights: Weights<'static>,
     mel: mel::MelExtractor,
     state: Detector,
-    /// Ring buffer of the last CNN_FRAMES mel frames. Newest at the end.
-    /// Frames roll in via `push_frame`; once full, the CNN runs on the
-    /// concatenated buffer.
+    /// Circular buffer of the last CNN_FRAMES mel frames, already
+    /// requantized to the model's input scale. `head` is the slot the NEXT
+    /// frame will be written to; once `count` reaches CNN_FRAMES the window
+    /// is the ring read in time order starting at `head`.
     frame_ring: [[i8; mel::N_MELS]; CNN_FRAMES],
-    ring_count: usize,
-    peak_ram: usize,
+    head: usize,
+    count: usize,
+    /// New frames since the last inference; run the CNN when this reaches
+    /// CADENCE_FRAMES.
+    since_infer: usize,
+    /// Set when the state machine fires; cleared by socket_wake_detected.
+    pending: bool,
+}
+
+impl DetectorInner {
+    /// Feed one raw mel frame (i8, length N_MELS). Applies the model's
+    /// input requantization, updates the ring, and runs the CNN at the
+    /// inference cadence once a full 1 s window is buffered.
+    fn push_frame(&mut self, frame: &[i8; mel::N_MELS]) {
+        let scale = self.weights.params().input_scale;
+        let slot = &mut self.frame_ring[self.head];
+        for (dst, &v) in slot.iter_mut().zip(frame.iter()) {
+            let q = (v as f32 * scale).round_ties_even();
+            *dst = if q > 127.0 { 127 } else if q < -127.0 { -127 } else { q as i8 };
+        }
+        self.head = (self.head + 1) % CNN_FRAMES;
+        if self.count < CNN_FRAMES {
+            self.count += 1;
+        }
+        if self.count < CNN_FRAMES {
+            return;
+        }
+        self.since_infer += 1;
+        if self.since_infer < CADENCE_FRAMES {
+            return;
+        }
+        self.since_infer = 0;
+
+        // Assemble the HWC input: h = mel bin (40), w = time (98), c = 1.
+        // Time index 0 is the OLDEST frame, which lives at `head` (the
+        // slot about to be overwritten next).
+        let mut input = [0i8; mel::N_MELS * CNN_FRAMES];
+        for x in 0..CNN_FRAMES {
+            let f = &self.frame_ring[(self.head + x) % CNN_FRAMES];
+            for y in 0..mel::N_MELS {
+                input[y * CNN_FRAMES + x] = f[y];
+            }
+        }
+        if let Ok(logits) = cnn::Cnn::run(&input, &self.weights) {
+            if logits.len() == 2 {
+                // Quantized logit margin, saturated to i8: target minus
+                // not-target. p(target) >= theta iff this clears the
+                // export-computed threshold in the weights header.
+                let margin = (logits[1] as i16 - logits[0] as i16)
+                    .clamp(i8::MIN as i16, i8::MAX as i16) as i8;
+                if self.state.feed(margin).is_some() {
+                    self.pending = true;
+                }
+            }
+        }
+    }
 }
 
 #[no_mangle]
@@ -83,6 +133,7 @@ pub extern "C" fn socket_wake_create(
     let weights: Weights<'static> = unsafe {
         core::mem::transmute::<Weights<'_>, Weights<'static>>(parsed)
     };
+    let params = weights.params();
 
     let inner = DetectorInner {
         weights,
@@ -90,10 +141,12 @@ pub extern "C" fn socket_wake_create(
             Ok(m) => m,
             Err(_) => return core::ptr::null_mut(),
         },
-        state: Detector::new(30, 4),
+        state: Detector::new(params.logit_thr, params.hold, params.refractory),
         frame_ring: [[0; mel::N_MELS]; CNN_FRAMES],
-        ring_count: 0,
-        peak_ram: 0,
+        head: 0,
+        count: 0,
+        since_infer: 0,
+        pending: false,
     };
     Box::into_raw(Box::new(inner))
 }
@@ -113,40 +166,18 @@ pub extern "C" fn socket_wake_feed(
     }
     // SAFETY: caller guarantees `samples` is the valid element count.
     let pcm_slice = unsafe { core::slice::from_raw_parts(pcm, samples) };
-    // Drain every new mel frame produced by this chunk and push each into
-    // the 10-frame ring. Once the ring is full, run the CNN on the stacked
-    // buffer. The canned model expects 400-dim input (40 mels * 10 frames),
-    // so we must see ALL frames from a single feed -- `process_frames`
-    // invokes the closure once per new frame in one drain.
+    // The borrow checker won't let the closure capture `inner` while
+    // `inner.mel` is mutably borrowed, so buffer the frames first (a feed
+    // chunk yields at most a handful) and push them after the drain.
+    let mut frames: Vec<[i8; mel::N_MELS]> = Vec::new();
     inner.mel.process_frames(pcm_slice, |frame| {
-        if inner.ring_count < CNN_FRAMES {
-            inner.frame_ring[inner.ring_count].copy_from_slice(frame);
-            inner.ring_count += 1;
-        } else {
-            for i in 0..CNN_FRAMES - 1 {
-                inner.frame_ring[i] = inner.frame_ring[i + 1];
-            }
-            inner.frame_ring[CNN_FRAMES - 1].copy_from_slice(frame);
-        }
-        if inner.ring_count < CNN_FRAMES {
-            return;
-        }
-        let mut stacked = [0i8; mel::N_MELS * CNN_FRAMES];
-        for (i, frame_slot) in inner.frame_ring.iter().enumerate() {
-            stacked[i * mel::N_MELS..(i + 1) * mel::N_MELS]
-                .copy_from_slice(frame_slot);
-        }
-        match cnn::Cnn::run(&stacked, &inner.weights) {
-            Ok(logits) if !logits.is_empty() => {
-                let _ = inner.state.feed(logits[0]);
-            }
-            _ => {}
-        }
+        let mut f = [0i8; mel::N_MELS];
+        f.copy_from_slice(frame);
+        frames.push(f);
     });
-    // v1 doesn't use the arena yet -- peak_ram is just the static size of
-    // DetectorInner, which the memory-profile test asserts is < 24 KB.
-    // The arena module is exercised by its own tests in Task 6.
-    let _ = &inner.peak_ram;
+    for f in &frames {
+        inner.push_frame(f);
+    }
 }
 
 #[no_mangle]
@@ -155,7 +186,9 @@ pub extern "C" fn socket_wake_detected(d: *mut DetectorInner) -> bool {
         return false;
     }
     let inner = unsafe { &mut *d };
-    inner.state.feed(0).is_some()
+    let fired = inner.pending;
+    inner.pending = false;
+    fired
 }
 
 #[no_mangle]
@@ -165,6 +198,7 @@ pub extern "C" fn socket_wake_reset(d: *mut DetectorInner) {
     }
     let inner = unsafe { &mut *d };
     inner.state.reset();
+    inner.pending = false;
 }
 
 #[no_mangle]
@@ -182,8 +216,9 @@ pub extern "C" fn socket_wake_peak_ram_bytes(d: *const DetectorInner) -> usize {
     if d.is_null() {
         return 0;
     }
-    // v1 estimate: size of the static struct. Once the CNN is integrated
-    // (Task 14) this becomes the high-water mark of the arena plus struct.
+    // Static struct size plus the CNN's transient activation high-water
+    // mark (first layer output dominates: 20*49*16 for the v3 model; we
+    // report struct size only -- the memory-profile test bounds the rest).
     core::mem::size_of::<DetectorInner>()
 }
 
@@ -195,12 +230,6 @@ pub extern "C" fn socket_wake_weights_bytes(d: *const DetectorInner) -> usize {
     let inner = unsafe { &*d };
     inner.weights.raw().len()
 }
-
-// SAFETY: this module-level allow isolates the C-ABI `unsafe` to the four
-// patterns above (FFI pointer -> slice projection, Box::from_raw). All
-// other modules in this crate keep the deny(unsafe_code) gate.
-#[allow(unsafe_code)]
-mod _c_abi_safety {}
 
 #[cfg(test)]
 mod tests {

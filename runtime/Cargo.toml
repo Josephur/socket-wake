@@ -11,3 +11,5 @@ default = ["std"]
 std = []
 
 [dependencies]
+libm = { version = "0.2", default-features = false }
+microfft = { version = "0.6", default-features = false, features = ["size-512"] }

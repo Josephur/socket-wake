@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Detection state machine. The CNN emits a single logit per frame; we
-//! require it to exceed `threshold` for `hold_frames` consecutive frames
-//! before firing, with any sub-threshold frame resetting the counter.
-//! This is the canonical "debounce" pattern for keyword spotting and
-//! trades a small amount of latency (one extra frame) for dramatically
-//! fewer false positives.
+//! Detection state machine, matching the streaming detector validated in
+//! `python/socket_wake/eval_v3.py`: the CNN emits a quantized logit margin
+//! (target minus not-target) per inference; we require it to reach
+//! `threshold` for `hold` consecutive inferences before firing, with any
+//! sub-threshold inference resetting the counter. After a fire the detector
+//! enters a refractory lockout for `refractory` inferences, then re-arms
+//! automatically.
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Detection;
@@ -12,30 +13,33 @@ pub struct Detection;
 #[derive(Debug, PartialEq)]
 pub struct Detector {
     threshold: i8,
-    hold_frames: u8,
+    hold: u8,
+    refractory: u16,
     count: u8,
-    fired: bool,
+    lockout: u16,
 }
 
 impl Detector {
-    /// `threshold` is the per-frame logit floor; `hold_frames` is how many
-    /// consecutive frames must clear it before we fire (typical: 3-5).
-    pub fn new(threshold: i8, hold_frames: u8) -> Self {
-        Self {
-            threshold,
-            hold_frames,
-            count: 0,
-            fired: false,
-        }
+    /// `threshold` is the per-inference logit-margin floor; `hold` is how
+    /// many consecutive inferences must clear it before we fire (the v3
+    /// benchmark used 2); `refractory` is the post-fire lockout measured in
+    /// inferences (the v3 benchmark used 32 = 1 s at a 30 ms cadence).
+    pub fn new(threshold: i8, hold: u8, refractory: u16) -> Self {
+        Self { threshold, hold, refractory, count: 0, lockout: 0 }
     }
 
-    /// Returns `Some(Detection)` exactly once per wake event. To re-arm,
-    /// call `reset()` after the consumer has handled the detection.
-    pub fn feed(&mut self, logit: i8) -> Option<Detection> {
-        if logit >= self.threshold {
+    /// Returns `Some(Detection)` exactly once per wake event. The detector
+    /// re-arms automatically once the refractory period has elapsed.
+    pub fn feed(&mut self, margin: i8) -> Option<Detection> {
+        if self.lockout > 0 {
+            self.lockout -= 1;
+            return None;
+        }
+        if margin >= self.threshold {
             self.count = self.count.saturating_add(1);
-            if !self.fired && self.count >= self.hold_frames {
-                self.fired = true;
+            if self.count >= self.hold {
+                self.count = 0;
+                self.lockout = self.refractory;
                 return Some(Detection);
             }
         } else {
@@ -44,18 +48,18 @@ impl Detector {
         None
     }
 
-    /// Re-arm the detector so it can fire again on the next qualifying
-    /// sequence. Call after the consumer has handled the previous
-    /// detection (typically inside a single-tap handler).
+    /// Clear the hold counter and any refractory lockout, re-arming the
+    /// detector immediately.
     pub fn reset(&mut self) {
         self.count = 0;
-        self.fired = false;
+        self.lockout = 0;
     }
 
     pub fn threshold(&self) -> i8 { self.threshold }
-    pub fn hold_frames(&self) -> u8 { self.hold_frames }
+    pub fn hold(&self) -> u8 { self.hold }
+    pub fn refractory(&self) -> u16 { self.refractory }
     pub fn count(&self) -> u8 { self.count }
-    pub fn fired(&self) -> bool { self.fired }
+    pub fn in_lockout(&self) -> bool { self.lockout > 0 }
 }
 
 #[cfg(test)]
@@ -64,27 +68,27 @@ mod tests {
 
     #[test]
     fn silent_until_threshold_crossed() {
-        let mut d = Detector::new(50, 3);
+        let mut d = Detector::new(50, 3, 10);
         for _ in 0..10 {
             assert_eq!(d.feed(10), None);
         }
         assert_eq!(d.count(), 0);
-        assert!(!d.fired());
     }
 
     #[test]
-    fn fires_after_required_hold_frames() {
-        let mut d = Detector::new(50, 3);
+    fn fires_after_required_hold() {
+        let mut d = Detector::new(50, 3, 100);
         assert_eq!(d.feed(80), None);
         assert_eq!(d.feed(80), None);
         assert_eq!(d.feed(80), Some(Detection));
-        // Once fired, additional high frames don't refire.
+        // Refractory: additional high frames don't refire.
         assert_eq!(d.feed(80), None);
+        assert!(d.in_lockout());
     }
 
     #[test]
-    fn resets_after_silence() {
-        let mut d = Detector::new(50, 3);
+    fn sub_threshold_resets_counter() {
+        let mut d = Detector::new(50, 3, 10);
         assert_eq!(d.feed(80), None);
         assert_eq!(d.feed(80), None);
         assert_eq!(d.feed(0), None);      // gap resets the counter
@@ -93,30 +97,42 @@ mod tests {
     }
 
     #[test]
-    fn manual_reset_re_arms() {
-        let mut d = Detector::new(50, 2);
+    fn rearms_after_refractory() {
+        let mut d = Detector::new(50, 2, 3);
         assert_eq!(d.feed(80), None);
         assert_eq!(d.feed(80), Some(Detection));
+        // 3 inferences of lockout, even above threshold.
+        assert_eq!(d.feed(80), None);
+        assert_eq!(d.feed(80), None);
+        assert_eq!(d.feed(80), None);
+        // Re-armed: two more hits fire again.
+        assert_eq!(d.feed(80), None);
+        assert_eq!(d.feed(80), Some(Detection));
+    }
+
+    #[test]
+    fn manual_reset_clears_lockout() {
+        let mut d = Detector::new(50, 2, 1000);
+        assert_eq!(d.feed(80), None);
+        assert_eq!(d.feed(80), Some(Detection));
+        assert!(d.in_lockout());
         d.reset();
-        assert!(!d.fired());
+        assert!(!d.in_lockout());
         assert_eq!(d.feed(80), None);
         assert_eq!(d.feed(80), Some(Detection));
     }
 
     #[test]
     fn hold_of_one_fires_immediately() {
-        let mut d = Detector::new(50, 1);
+        let mut d = Detector::new(50, 1, 10);
         assert_eq!(d.feed(80), Some(Detection));
     }
 
     #[test]
-    fn hold_of_zero_fires_immediately() {
-        // With hold_frames=0 the count starts at 0 and the `>= 0` check
-        // passes on the first frame -- i.e. hold=0 degenerates to "fire
-        // immediately on any above-threshold frame". Tests document this
-        // explicitly so future readers don't expect zero hold to mean
-        // "never fires".
-        let mut d = Detector::new(50, 0);
-        assert_eq!(d.feed(80), Some(Detection));
+    fn negative_margins_stay_silent() {
+        let mut d = Detector::new(20, 2, 10);
+        for _ in 0..5 {
+            assert_eq!(d.feed(-100), None);
+        }
     }
 }

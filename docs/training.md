@@ -414,23 +414,45 @@ meets the ≤1/hr ambient-noise bar with high recall at realistic SNRs and
 negligible quantization loss, at a few percent of one core. v2's failure
 was methodology, not model capacity or data volume.
 
-### Deployment gap (next tasks, in order)
+### Deployment gap — CLOSED (2026-07-04)
 
-The v3 model is validated in Python simulation only. To ship it:
+The three tasks that stood between the v3 simulation and a shippable
+runtime are done:
 
-1. **Runtime kernel fixes** (`runtime/src/`): `apply_layer` has no
-   activation function between layers (stacked layers would still be
-   linear); `conv2d_pw` indexes weights per spatial position (a
-   locally-connected layer, not a shared-weight 1x1 conv) and
-   `weights.rs`'s depthwise weight-count formula disagrees with
-   `cnn.rs`'s indexing; there is no stride support (KWSConvNet uses
-   stride-2 convs); `lib.rs` feeds `logits[0]` (NOT-target) to the
-   state machine instead of the target-class score.
-2. **Multi-layer export** replacing the lstsq collapse: per-layer
-   symmetric INT8 (weight scale, bias in accumulator units, requant
-   multiplier in the layer's `scale` field), matching `Int8Sim`'s
-   arithmetic bit-for-bit, with a Python-generates / Rust-verifies
-   parity test.
-3. **Rust-side streaming benchmark** driving the real C ABI over the
-   same held-out streams, confirming the simulated numbers on the real
-   integer kernels, then on-device.
+1. **Runtime kernel fixes** (`runtime/src/`) — all the documented bugs
+   (no inter-layer activation, locally-connected `conv2d_pw`, depthwise
+   weight-count mismatch, missing stride, NOT-target logit fed to the
+   state machine) are fixed in a rewritten kernel set behind the SWWT v2
+   weights format: per-layer ReLU flag, stride, f32 requant scale + f32
+   bias (output-scale units), a general `conv2d` kind for the stem, and
+   GAP folded into the dense layer's scale. The header now carries
+   `input_scale` plus the detector parameters (logit-margin threshold,
+   hold=2, refractory=32) so the blob fully describes deployment
+   behavior. `lib.rs` buffers the 98-frame (1 s) window and runs
+   inference at the 30 ms cadence the benchmark used, feeding the state
+   machine the quantized target-minus-not logit margin.
+2. **Multi-layer export** (`python -m socket_wake.export`) replaces the
+   lstsq collapse: per-tensor symmetric INT8 per layer, matching
+   `Int8Sim` (max |p_target| gap 0.009 on held-out windows, asserted
+   < 0.02 at export time). `socket_wake/int8_ref.py` is the integer
+   twin of the Rust kernels; the exporter emits parity vectors and
+   `runtime/tests/parity_test.rs` verifies **bit-identical logits on
+   all 24 held-out windows**. Blob size: 2,814 bytes.
+3. **Rust-side streaming check**: on the way there we found the REAL
+   fourth gap — the Rust mel frontend never actually matched Python
+   (`test_bit_matches_rust_reference` was skipped): Hann window used
+   sin instead of cos, different filterbank bin formula, low-accuracy
+   Taylor DFT, and truncation instead of rounding at the INT8 step.
+   `mel.rs` is rewritten (microfft + libm, Python-matching formulas);
+   `runtime/tests/mel_parity_test.rs` now shows **7920/7920 mel values
+   bit-identical** on 2 s of reference audio. With that fixed,
+   `cargo run --release --example stream_check` over held-out streams
+   (`python -m socket_wake.dump_streams`, A/B against
+   `python -m socket_wake.score_streams`) reproduces the simulation:
+   8/8 positive trials fire exactly once at 20 dB SNR, 0 fires in 2 min
+   of held-out noise (sim: 0), 10 fires on the adversarial hard-negative
+   stream (sim: 11 — the known near-miss weak spot, see above).
+
+Remaining before "done": on-device integration (ESP32-P4 static lib +
+Socket firmware wiring) and, later, a hard-negative mining round for the
+phonetic near-miss weakness.
