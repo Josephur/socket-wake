@@ -14,10 +14,12 @@ __pycache__/
 *.ckpt
 *.pth
 *.onnx
-models/*/checkpoint.pt
+models/*/checkpoint*.pt
 models/*/train_dataset*.pt
 models/*/train_data.npz
 models/*/noise_clips/
+models/*/tts_cache/
+tmp_build_v3.log
 # IDE
 .vscode/
 .idea/build.log

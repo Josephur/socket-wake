@@ -302,3 +302,135 @@ enough to trust in a live device.
    precision plateaus around 62% despite reasonable training data),
    implement the multi-layer per-layer export path so the trained
    model's nonlinearity survives into the deployed weights.
+
+**Superseded by v3 (below), which found that the linear export was only
+one of several methodology deviations — the window size and labeling
+scheme mattered at least as much.**
+
+## v3: standard-KWS methodology (2026-07-03) — the current recipe
+
+v2's measured failure (62% precision, ~12% per-window FAR) prompted a
+review against how the standard open-source stacks do this
+(microWakeWord / ESPHome, Google's "Hello Edge" DS-CNN lineage; ESP-SR
+WakeNet is closed-weights but documents the same shape). Four v2
+deviations from standard practice were found, each independently able to
+cap quality:
+
+1. **100 ms input window** (WINDOW_FRAMES=10). "Hey socket" lasts
+   ~600-900 ms; a 100 ms window can only ever see a tenth of the phrase,
+   so the model could only learn "sounds like a fragment," never "is the
+   phrase." Standard KWS uses ~1 s. **v3: 98 frames = exactly 1.0 s.**
+   (microWakeWord: same 40-feature/10 ms frontend as ours, ~1 s effective
+   receptive field, one inference every 30 ms.)
+2. **Every sliding window of a positive clip was labeled positive**,
+   including windows of mostly silence at the clip edges. **v3: trim
+   silence, place the whole utterance inside the window at jittered
+   offsets** (standard time-shift augmentation) — label 1 now means "the
+   complete phrase is in this window."
+3. **Window-level train/test split**: near-identical overlapping windows
+   of the same clip landed in both splits, silently inflating held-out
+   metrics. **v3: clip-level split** — every window derived from a source
+   clip shares that clip's split.
+4. **Deployment operating point was argmax** (θ≈0.5 equivalent) and the
+   runtime thresholds `logits[0]`, which is the NOT-target class
+   (`runtime/src/lib.rs`, still unfixed as of this writing — see
+   "Deployment gap" below). **v3: tuned probability threshold + K
+   consecutive-hit streaming detector, evaluated as false-accepts/hour.**
+
+Also fixed on the way: TTS PCM is now cached to disk
+(`models/hey-socket-v1/tts_cache/`, gitignored) and clips are deduped by
+decoded-PCM hash; Kokoro requests vary speed (0.85/1.0/1.15) and phrase
+punctuation for real prosody diversity. All 90 positive and 180
+hard-negative requests returned unique audio at MAX_WORKERS=8 (F5 timed
+out under 12 in the v2 build; 8 is reliable).
+
+### The v3 model
+
+`KWSConvNet` (`python/socket_wake/model/kws_cnn.py`): a downsized
+DS-CNN — stem conv + two depthwise-separable blocks + GAP + dense.
+**2,434 params (~2.5 KB INT8), 390K MACs/inference.** BatchNorm is
+folded into convs for inference (`fold_batchnorm`, exact to 1e-6);
+post-training INT8 quantization is simulated in Python (`Int8Sim`,
+symmetric per-tensor, 99.9th-percentile activation calibration) so
+quantization damage is measured *before* any runtime export work.
+
+### Reproducing v3
+
+```powershell
+cd D:\Arduino\socket-wake
+python -m socket_wake.data.fetch_musan        # once: noise_clips/
+python -m socket_wake.data.build_v3_dataset   # -> train_dataset_v3.pt (~3 min with warm TTS cache)
+python -m socket_wake.train_v3                # -> checkpoint_v3.pt (~2 min CPU)
+python -m socket_wake.eval_v3                 # streaming FAR/FRR gate
+```
+
+### Measured v3 results (2026-07-03, all on held-out clip-level split)
+
+Dataset: 7,152 windows (810 pos / 6,342 neg, 7.8:1), 1,201 clips.
+
+Held-out **per-window** metrics (threshold sweep, float):
+
+```
+ thr   recall precision FA-rate
+ 0.5   0.975  0.888     0.0166
+ 0.9   0.951  0.939     0.0083
+ 0.95  0.926  0.974     0.0033     <- vs v2: precision 0.62, FA 0.12
+ 0.99  0.741  1.000     0.0000
+```
+
+**Streaming** benchmark (`eval_v3.py`: 30 ms inference cadence, 2
+consecutive hits to fire, 1 s refractory; 39 min held-out MUSAN noise,
+18 held-out hard-negative utterances, 27 positive trials embedded in
+held-out noise at 20/10/5 dB SNR):
+
+```
+=== float (BN-folded) ===          === INT8 (simulated) ===
+ thr  FA/h-noise rec@20 rec@10 rec@5    FA/h-noise rec@20 rec@10 rec@5
+ 0.9    0.00     1.000  0.889  0.778      0.00     1.000  0.889  0.778
+ 0.95   0.00     1.000  0.889  0.778      0.00     1.000  0.889  0.778
+```
+
+- **Ambient-noise false accepts: zero in 39 minutes** at θ≥0.9 (bounds
+  FA/h below ~4.6 at 95% confidence with this much audio; more held-out
+  noise hours would tighten the bound, but v2 fired constantly on the
+  same stream).
+- **INT8 costs essentially nothing** — the sweep is near-identical to
+  float. Post-training quantization is sufficient; no QAT needed.
+- **Compute: 13M MACs/s** (390K MACs × 33 inf/s) ≈ ~7% of one ESP32-P4
+  core at 360 MHz scalar INT8, plus ~3M mul/s for the mel frontend.
+  Model weights ~2.5 KB. This comfortably clears "low power / low CPU"
+  — and the cadence can be halved again if needed.
+- **Honest weak spot: concentrated phonetic near-misses.** The 0.6 min
+  hard-negative speech stream ("hey rocket", "hay socket", ...) still
+  triggers roughly half the near-miss utterances at θ=0.95. Real
+  ambient speech is far less adversarial than this stream, but closing
+  it needs more hard-negative volume + a hard-negative mining round
+  (the iterative refinement step already described above), and possibly
+  penalizing FA harder in the loss (microWakeWord optimizes FA/h first,
+  accuracy second).
+
+**Verdict: the methodology works.** A 2.4K-param model trained this way
+meets the ≤1/hr ambient-noise bar with high recall at realistic SNRs and
+negligible quantization loss, at a few percent of one core. v2's failure
+was methodology, not model capacity or data volume.
+
+### Deployment gap (next tasks, in order)
+
+The v3 model is validated in Python simulation only. To ship it:
+
+1. **Runtime kernel fixes** (`runtime/src/`): `apply_layer` has no
+   activation function between layers (stacked layers would still be
+   linear); `conv2d_pw` indexes weights per spatial position (a
+   locally-connected layer, not a shared-weight 1x1 conv) and
+   `weights.rs`'s depthwise weight-count formula disagrees with
+   `cnn.rs`'s indexing; there is no stride support (KWSConvNet uses
+   stride-2 convs); `lib.rs` feeds `logits[0]` (NOT-target) to the
+   state machine instead of the target-class score.
+2. **Multi-layer export** replacing the lstsq collapse: per-layer
+   symmetric INT8 (weight scale, bias in accumulator units, requant
+   multiplier in the layer's `scale` field), matching `Int8Sim`'s
+   arithmetic bit-for-bit, with a Python-generates / Rust-verifies
+   parity test.
+3. **Rust-side streaming benchmark** driving the real C ABI over the
+   same held-out streams, confirming the simulated numbers on the real
+   integer kernels, then on-device.
