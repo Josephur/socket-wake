@@ -168,7 +168,7 @@ impl MelExtractor {
                 energy += w * spec[filter.lo + j];
             }
             let log_e = libm::log10f(energy + 1e-6);
-            let q = (log_e * 127.0 / INT8_SCALE).round_ties_even();
+            let q = libm::rintf(log_e * 127.0 / INT8_SCALE);
             self.out[m] = q.clamp(-127.0, 127.0) as i8;
         }
     }

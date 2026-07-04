@@ -84,7 +84,7 @@ fn decode_bias(bytes: &[u8], out_c: usize) -> [f32; 256] {
 /// operation order and round-half-to-even must match int8_ref.py exactly.
 #[inline]
 fn requant(acc: i32, scale: f32, bias: f32, relu: bool) -> i8 {
-    let q = (acc as f32 * scale + bias).round_ties_even();
+    let q = libm::rintf(acc as f32 * scale + bias);
     let lo = if relu { 0.0 } else { -127.0 };
     if q > 127.0 { 127 } else if q < lo { lo as i8 } else { q as i8 }
 }

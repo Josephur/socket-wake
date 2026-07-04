@@ -16,7 +16,50 @@
 #![allow(unsafe_code)]
 
 extern crate alloc;
+use alloc::boxed::Box;
 use alloc::vec::Vec;
+
+/// Bare-metal (ESP-IDF / Arduino) support: route Rust allocations to the
+/// platform C heap and abort on panic. Only compiled for no_std targets
+/// with no OS (e.g. riscv32imafc-unknown-none-elf for the ESP32-P4); host
+/// builds and tests use std.
+#[cfg(all(not(feature = "std"), target_os = "none"))]
+mod bare_metal {
+    use core::alloc::{GlobalAlloc, Layout};
+
+    extern "C" {
+        fn malloc(size: usize) -> *mut core::ffi::c_void;
+        fn free(ptr: *mut core::ffi::c_void);
+        fn abort() -> !;
+    }
+
+    struct CHeap;
+
+    // SAFETY: defers to the platform malloc/free, which newlib guarantees
+    // 8-byte aligned -- enough for every type this crate allocates (the
+    // alignment check rejects anything larger rather than returning
+    // under-aligned memory).
+    unsafe impl GlobalAlloc for CHeap {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            if layout.align() > 8 {
+                return core::ptr::null_mut();
+            }
+            malloc(layout.size()) as *mut u8
+        }
+        unsafe fn dealloc(&self, ptr: *mut u8, _layout: Layout) {
+            free(ptr as *mut core::ffi::c_void)
+        }
+    }
+
+    #[global_allocator]
+    static HEAP: CHeap = CHeap;
+
+    #[panic_handler]
+    fn panic(_info: &core::panic::PanicInfo) -> ! {
+        // SAFETY: newlib abort never returns.
+        unsafe { abort() }
+    }
+}
 
 pub mod arena;
 pub mod cnn;
@@ -69,7 +112,7 @@ impl DetectorInner {
         let scale = self.weights.params().input_scale;
         let slot = &mut self.frame_ring[self.head];
         for (dst, &v) in slot.iter_mut().zip(frame.iter()) {
-            let q = (v as f32 * scale).round_ties_even();
+            let q = libm::rintf(v as f32 * scale);
             *dst = if q > 127.0 { 127 } else if q < -127.0 { -127 } else { q as i8 };
         }
         self.head = (self.head + 1) % CNN_FRAMES;

@@ -3,6 +3,7 @@
 #define SOCKET_WAKE_H
 
 #include <stddef.h>
+#include <stdint.h>
 #include <stdbool.h>
 
 #ifdef __cplusplus
@@ -23,7 +24,7 @@ typedef struct socket_wake_detector_internal socket_wake_detector_t;
  * The weights buffer is borrowed, not copied. */
 socket_wake_detector_t *socket_wake_create(const void *weights,
                                             size_t weights_bytes,
-                                            size_t sample_rate_hz);
+                                            uint32_t sample_rate_hz);
 
 /* Append PCM samples to the running detector. Buffers internally until a
  * mel frame is available, then runs the CNN and updates the state machine.
@@ -31,8 +32,9 @@ socket_wake_detector_t *socket_wake_create(const void *weights,
 void socket_wake_feed(socket_wake_detector_t *d,
                        const short *pcm, size_t samples);
 
-/* Returns true exactly once per wake event. After handling, the caller
- * should call socket_wake_reset() to re-arm. */
+/* Returns true exactly once per wake event. The detector re-arms itself
+ * after the refractory period in the weights header; reset() is only
+ * needed to clear the lockout early. */
 bool socket_wake_detected(socket_wake_detector_t *d);
 
 /* Re-arm the state machine so it can fire again. */
